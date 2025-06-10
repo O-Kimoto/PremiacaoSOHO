@@ -1,0 +1,615 @@
+import pandas as pd
+import numpy as np
+import xlsxwriter
+from xlsxwriter.utility import xl_col_to_name
+
+def calcular_faixa(valor_liquido):
+    if valor_liquido <= 1000:
+        return 0.25
+    elif valor_liquido <= 1500:
+        return 0.50
+    elif valor_liquido <= 2000:
+        return 0.75
+    else:
+        return 1.00
+
+def calcular_premiacao_com_resumo(input_excel_path, output_excel_path):
+    try:
+        # --- Leitura da aba principal (“Planilha1”) ---
+        df_input = pd.read_excel(input_excel_path, sheet_name="Planilha1")
+        df_input.columns = df_input.columns.str.strip().str.upper()
+
+        # --- Leitura da aba de ausências (“Ausencias”) ---
+        df_ausencias = pd.read_excel(input_excel_path, sheet_name="Ausencias")
+        aus_cols = [col.strip().upper() for col in df_ausencias.columns]
+        idx_consultor = aus_cols.index('CONSULTOR')
+        idx_ausencias = aus_cols.index('AUSENCIAS')
+        nome_coluna_consultor = df_ausencias.columns[idx_consultor]
+        nome_coluna_ausencias = df_ausencias.columns[idx_ausencias]
+
+        ausencias_dict = {
+            str(row[nome_coluna_consultor]).strip().upper(): int(row[nome_coluna_ausencias])
+            for _, row in df_ausencias.iterrows()
+            if not pd.isnull(row[nome_coluna_consultor]) and not pd.isnull(row[nome_coluna_ausencias])
+        }
+        consultores_com_ausencia = {nome for nome, aus in ausencias_dict.items() if aus >= 1}
+
+        # --- Mapeamento de colunas na aba principal ---
+        column_mapping = {
+            'CONSULTOR': 'consultor',
+            'SUPERVISOR': 'supervisor',
+            'COORDENADOR': 'coordenador',
+            'VALOR PRODUTO ATUAL': 'VALOR PRODUTO ATUAL',
+            'DATA EVENTO': 'DATA EVENTO',
+            'DATA BAIXA': 'DATA BAIXA',
+            'MOVIMENTO PRINCIPAL': 'MOVIMENTO PRINCIPAL',
+            'CNPJ / CPF CLIENTE': 'CNPJ / CPF CLIENTE',
+            'PRODUTO ATUAL': 'PRODUTO ATUAL',
+            'NOME CLIENTE': 'NOME CLIENTE'
+        }
+        df_input.rename(columns=column_mapping, inplace=True)
+
+        # --- Verificação de colunas essenciais ---
+        required_columns = [
+            'consultor', 'supervisor', 'VALOR PRODUTO ATUAL',
+            'MOVIMENTO PRINCIPAL', 'DATA EVENTO', 'DATA BAIXA'
+        ]
+        missing_columns = [col for col in required_columns if col not in df_input.columns]
+        if missing_columns:
+            raise KeyError(f"Colunas essenciais ausentes: {', '.join(missing_columns)}")
+
+        # --- Conversão de tipos e preenchimento de NA ---
+        df_input["VALOR PRODUTO ATUAL"] = pd.to_numeric(
+            df_input["VALOR PRODUTO ATUAL"], errors='coerce'
+        ).fillna(0)
+        df_input["DATA EVENTO"] = pd.to_datetime(
+            df_input["DATA EVENTO"], errors='coerce', dayfirst=True
+        )
+        df_input["DATA BAIXA"] = pd.to_datetime(
+            df_input["DATA BAIXA"], errors='coerce', dayfirst=True
+        )
+        df_input["consultor"] = df_input["consultor"].fillna("Consultor Desconhecido")
+        df_input["supervisor"] = df_input["supervisor"].fillna("Supervisor Desconhecido")
+        df_input["coordenador"] = df_input.get("coordenador", "N/A")
+        df_input["MOVIMENTO PRINCIPAL"] = df_input["MOVIMENTO PRINCIPAL"].astype(str)\
+                                          .str.strip().str.title()
+
+        # --- Cálculo de Receita Bruta, Multiplicador, Pontos Finais, UGR e Movel Count ---
+        df_input["Receita Bruta"] = np.abs(df_input["VALOR PRODUTO ATUAL"])
+
+        def get_multiplicador(movimento_principal, consultor):
+            mov = movimento_principal.lower()
+            c = consultor.strip().upper()
+            if "desconexao indicacao" in mov:
+                return -2 if c in consultores_com_ausencia else -1
+            elif "desconexao" in mov:
+                return -1.4 if c in consultores_com_ausencia else -0.7
+            elif movimento_principal in ["Ativo", "Migracao", "Ativo Base"]:
+                return 1
+            elif "indicacao" in mov:
+                return 0.7
+            else:
+                return 0
+
+        df_input["Multiplicador"] = df_input.apply(
+            lambda row: get_multiplicador(row["MOVIMENTO PRINCIPAL"], row["consultor"]),
+            axis=1
+        )
+        df_input["Pontos Finais"] = df_input["Receita Bruta"] * df_input["Multiplicador"]
+
+        def get_ugr(movimento_principal):
+            mov = movimento_principal.lower()
+            if "desconexao" in mov or "desconexão" in mov:
+                return -1.0
+            elif movimento_principal == "Desconexao Base":
+                return -0.5
+            elif movimento_principal == "Ativo":
+                return 1.0
+            elif "Ativo Base" in movimento_principal:
+                return 0.5
+            elif movimento_principal == "Ativo Indicacao":
+                return 1.0
+            elif movimento_principal == "Migracao Indicacao":
+                return 0.5
+            elif movimento_principal == "Migracao":
+                return 0.5
+            else:
+                return 0.0
+
+        df_input["UGR"] = df_input["MOVIMENTO PRINCIPAL"].apply(get_ugr)
+
+        def get_movel_count(movimento_principal):
+            mov = movimento_principal.lower()
+            if "desconexao" in mov or "desconexão" in mov:
+                return -1
+            elif movimento_principal in ["Ativo", "Ativo Indicacao", "Migracao Indicacao", "Migracao"]:
+                return 1
+            else:
+                return 0
+
+        df_input["Movel Count"] = df_input["MOVIMENTO PRINCIPAL"].apply(get_movel_count)
+
+        df_input = df_input.sort_values(
+            by=["supervisor", "consultor", "DATA EVENTO"],
+            ascending=True, na_position='last'
+        )
+
+        # --- Criação do arquivo de saída (Premiação Detalhada + Consolidado) ---
+        with pd.ExcelWriter(output_excel_path, engine='xlsxwriter') as writer:
+            workbook = writer.book
+
+            # ==== ABA “Premiacao Detalhada com Resumo” ====
+            worksheet = workbook.add_worksheet('Premiacao Detalhada com Resumo')
+
+            # Formatos para a aba detalhada
+            header_format = workbook.add_format({
+                'bold': True, 'fg_color': '#4F81BD', 'font_color': 'white', 'border': 1
+            })
+            currency_format = workbook.add_format({'num_format': 'R$ #,##0.00', 'border': 1})
+            percent_format = workbook.add_format({'num_format': '0.00%', 'border': 1})
+            default_format = workbook.add_format({'border': 1})
+            date_format = workbook.add_format({'num_format': 'dd/mm/yyyy', 'border': 1})
+            summary_label_format = workbook.add_format({'bold': True, 'border': 1, 'align': 'right'})
+            summary_value_format_currency = workbook.add_format({
+                'num_format': 'R$ #,##0.00', 'bold': True, 'border': 1
+            })
+            summary_value_format_percent = workbook.add_format({
+                'num_format': '0.00%', 'bold': True, 'border': 1
+            })
+            a_receber_label_format = workbook.add_format({
+                'bold': True, 'border': 1, 'align': 'right',
+                'fg_color': '#1F497D', 'font_color': 'white'
+            })
+            a_receber_value_format = workbook.add_format({
+                'num_format': 'R$ #,##0.00', 'bold': True, 'border': 1,
+                'fg_color': '#1F497D', 'font_color': 'white'
+            })
+            supervisor_header_format = workbook.add_format({
+                'bold': True, 'fg_color': '#D3D3D3', 'border': 1
+            })
+
+            # Ordem das colunas que iremos imprimir
+            output_columns_order = [
+                "coordenador", "supervisor", "consultor", "CNPJ / CPF CLIENTE",
+                "NOME CLIENTE", "MOVIMENTO PRINCIPAL", "DATA EVENTO", "DATA BAIXA",
+                "PRODUTO ATUAL", "VALOR PRODUTO ATUAL", "Receita Bruta",
+                "Multiplicador", "Pontos Finais", "UGR", "Movel Count"
+            ]
+
+            # Lista para armazenar referências necessárias para consolidado
+            consolidado_refs = []
+
+            current_row = 0
+            grouped = df_input.groupby(["supervisor", "consultor"], sort=False, dropna=False)
+
+            for (supervisor, consultor), group in grouped:
+                # Se não for o primeiro grupo, insere uma linha em branco
+                if current_row > 1:
+                    current_row += 1
+
+                # Cabeçalho de colunas na aba detalhada
+                for col_num, col_name in enumerate(output_columns_order):
+                    worksheet.write(current_row, col_num, col_name, header_format)
+                current_row += 1
+
+                # Define início e fim das linhas de dados deste consultor
+                start_row = current_row
+                end_row = current_row + len(group) - 1
+
+                # Índices de colunas para fórmulas
+                idx_receita = output_columns_order.index("Receita Bruta")
+                idx_multiplicador = output_columns_order.index("Multiplicador")
+                idx_pontos_finais = output_columns_order.index("Pontos Finais")
+                idx_ugr = output_columns_order.index("UGR")
+
+                # Células usadas no bloco de resumo deste consultor
+                summary_status_row = end_row + 1       # índice 0-based
+                summary_status_excel_row = summary_status_row + 1  # Excel 1-based
+                summary_start_col = 2  # Coluna C (índice 2)
+                absence_col_letter = xl_col_to_name(summary_start_col + 1)  # Coluna D
+                movimento_col_letter = xl_col_to_name(
+                    output_columns_order.index("MOVIMENTO PRINCIPAL")
+                )
+
+                # ===== Escreve cada linha de dados do grupo =====
+                for _, row_data in group.iterrows():
+                    for col_num, col_name in enumerate(output_columns_order):
+                        value = row_data.get(col_name, None)
+
+                        if col_name == "Multiplicador":
+                            mov_text = str(row_data["MOVIMENTO PRINCIPAL"]).lower()
+                            if "desconexao" in mov_text:
+                                # fórmula de Multiplicador no Excel
+                                absence_cell = f"{absence_col_letter}{summary_status_excel_row}"
+                                movement_cell = f"{movimento_col_letter}{current_row + 1}"
+                                formula = (
+                                    f'=IF({absence_cell}>=1,'
+                                    f'IF(ISNUMBER(SEARCH("indicacao",{movement_cell})),-1.4,-2),'
+                                    f'IF(ISNUMBER(SEARCH("indicacao",{movement_cell})),-1,-0.7))'
+                                )
+                                worksheet.write_formula(current_row, col_num, formula, default_format)
+                            else:
+                                worksheet.write_number(
+                                    current_row, col_num,
+                                    float(row_data["Multiplicador"]), default_format
+                                )
+
+                        elif col_name == "Pontos Finais":
+                            # fórmula: =Receita Bruta * Multiplicador
+                            receita_cell = f"{xl_col_to_name(idx_receita)}{current_row + 1}"
+                            multi_cell = f"{xl_col_to_name(idx_multiplicador)}{current_row + 1}"
+                            formula_pf = f"={receita_cell}*{multi_cell}"
+                            worksheet.write_formula(current_row, col_num, formula_pf, currency_format)
+
+                        elif col_name in ["DATA EVENTO", "DATA BAIXA"]:
+                            if pd.isna(value):
+                                worksheet.write(current_row, col_num, "", default_format)
+                            else:
+                                worksheet.write_datetime(current_row, col_num, value, date_format)
+
+                        elif col_name in ["VALOR PRODUTO ATUAL", "Receita Bruta"]:
+                            worksheet.write_number(current_row, col_num, float(value), currency_format)
+
+                        else:
+                            if pd.isna(value):
+                                worksheet.write(current_row, col_num, "", default_format)
+                            else:
+                                worksheet.write(current_row, col_num, value, default_format)
+
+                    current_row += 1
+
+                # ===== Bloco de Resumo para este consultor (aba detalhada) =====
+                nome_cons = str(group["consultor"].iloc[0]).strip().upper()
+                qtde_ausencias = ausencias_dict.get(nome_cons, 0)
+                worksheet.write(current_row, summary_start_col, "Status Ausência", summary_label_format)
+                worksheet.write(current_row, summary_start_col + 1, qtde_ausencias, summary_value_format_currency)
+                current_row += 1  # agora aponta para “Valor líquido”
+
+                # Localização “Valor líquido”
+                valor_liquido_row_excel = summary_status_row + 2   # (0-based + 1)
+                valor_liquido_col_letter = xl_col_to_name(summary_start_col + 1)
+
+                # → “Valor líquido”
+                worksheet.write(current_row, summary_start_col, "Valor líquido", summary_label_format)
+                valor_liquido_formula = (
+                    f"=SUM({xl_col_to_name(idx_pontos_finais)}"
+                    f"{start_row + 1}:{xl_col_to_name(idx_pontos_finais)}{end_row + 1})"
+                )
+                worksheet.write_formula(current_row, summary_start_col + 1, valor_liquido_formula, summary_value_format_currency)
+                current_row += 1  # agora aponta para “Faixa”
+
+                # → “Faixa”
+                faixa_formula = (
+                    f"=IF({valor_liquido_col_letter}{valor_liquido_row_excel}<=1000,0.25,"
+                    f"IF({valor_liquido_col_letter}{valor_liquido_row_excel}<=1500,0.5,"
+                    f"IF({valor_liquido_col_letter}{valor_liquido_row_excel}<=2000,0.75,1)))"
+                )
+                worksheet.write(current_row, summary_start_col, "Faixa", summary_label_format)
+                worksheet.write_formula(current_row, summary_start_col + 1, faixa_formula, summary_value_format_percent)
+                current_row += 1  # agora aponta para “Valor PJ”
+
+                # Localização “Faixa”
+                faixa_row_excel = (summary_status_row + 2) + 1
+                faixa_col_letter = xl_col_to_name(summary_start_col + 1)
+
+                # → “Valor PJ” (= Valor Líquido * Faixa)
+                valor_pj_formula = (
+                    f"={valor_liquido_col_letter}{valor_liquido_row_excel}*"
+                    f"{faixa_col_letter}{faixa_row_excel}"
+                )
+                worksheet.write(current_row, summary_start_col, "Valor PJ", summary_label_format)
+                worksheet.write_formula(current_row, summary_start_col + 1, valor_pj_formula, summary_value_format_currency)
+                current_row += 1  # agora aponta para “MDM (%)”
+
+                # Localização “Valor PJ”
+                valor_pj_row_excel = (summary_status_row + 2) + 2
+                valor_pj_col_letter = xl_col_to_name(summary_start_col + 1)
+
+                # → “MDM (%)”
+                intervalo_produto = (
+                    f"{xl_col_to_name(output_columns_order.index('PRODUTO ATUAL'))}"
+                    f"{start_row + 1}:"
+                    f"{xl_col_to_name(output_columns_order.index('PRODUTO ATUAL'))}"
+                    f"{end_row + 1}"
+                )
+                intervalo_movimento = (
+                    f"{xl_col_to_name(output_columns_order.index('MOVIMENTO PRINCIPAL'))}"
+                    f"{start_row + 1}:"
+                    f"{xl_col_to_name(output_columns_order.index('MOVIMENTO PRINCIPAL'))}"
+                    f"{end_row + 1}"
+                )
+                mdm_formula = f'=IFERROR(COUNTIF({intervalo_produto},"=MDM")/COUNTIF({intervalo_movimento},"*Ativ*"),0)'
+                worksheet.write(current_row, summary_start_col, "MDM (%)", summary_label_format)
+                worksheet.write_formula(current_row, summary_start_col + 1, mdm_formula, summary_value_format_percent)
+                current_row += 1  # agora aponta para “Desconto MDM < 15”
+
+                # Localização “MDM (%)”
+                mdm_row_excel = (summary_status_row + 2) + 3
+                mdm_col_letter = xl_col_to_name(summary_start_col + 1)
+
+                # → “Desconto MDM < 15”
+                desconto_formula = (
+                    f"=IF({mdm_col_letter}{mdm_row_excel}<=15%,"
+                    f"{valor_pj_col_letter}{valor_pj_row_excel}*0.1,0)"
+                )
+                worksheet.write(current_row, summary_start_col, "Desconto MDM < 15", summary_label_format)
+                worksheet.write_formula(current_row, summary_start_col + 1, desconto_formula, summary_value_format_currency)
+                current_row += 1  # agora aponta para “Penalidade ABS”
+
+                # Localização “Desconto MDM < 15”
+                desconto_row_excel = (summary_status_row + 2) + 4
+                desconto_col_letter = xl_col_to_name(summary_start_col + 1)
+
+                # → “Penalidade ABS” (fixo 0)
+                worksheet.write(current_row, summary_start_col, "Penalidade ABS", summary_label_format)
+                worksheet.write_number(current_row, summary_start_col + 1, 0.0, summary_value_format_currency)
+                current_row += 1  # agora aponta para “A receber”
+
+                # Localização “Penalidade ABS”
+                penalidade_row_excel = (summary_status_row + 2) + 5
+                penalidade_col_letter = xl_col_to_name(summary_start_col + 1)
+
+                # → “A receber” (IF((ValorPJ - Desconto - Penalidade) < 0; 0; …))
+                a_receber_row_excel = (summary_status_row + 2) + 6
+                a_receber_col_letter = xl_col_to_name(summary_start_col + 1)
+                cell_valor_pj = f"{valor_pj_col_letter}{valor_pj_row_excel}"
+                cell_mdm = f"{desconto_col_letter}{desconto_row_excel}"
+                cell_abs = f"{penalidade_col_letter}{penalidade_row_excel}"
+                a_receber_formula = (
+                    f"=IF(({cell_valor_pj}-{cell_mdm}-{cell_abs})<0,"
+                    f"0,({cell_valor_pj}-{cell_mdm}-{cell_abs}))"
+                )
+                worksheet.write(current_row, summary_start_col, "A receber", a_receber_label_format)
+                worksheet.write_formula(current_row, summary_start_col + 1, a_receber_formula, a_receber_value_format)
+                current_row += 1  # fim do bloco de resumo deste consultor
+
+                # --- Armazena referências para a aba Consolidado ---
+                # 1) Referência de “Receita” = valor_liquido_cell
+                receita_ref = f"'{worksheet.get_name()}'!{valor_liquido_col_letter}{valor_liquido_row_excel}"
+                # 2) “Linhas Válidas” (=SUM de UGR)
+                ugr_col_letter = xl_col_to_name(idx_ugr)
+                linhas_validas_formula = (
+                    f"=SUM('{worksheet.get_name()}'!"
+                    f"{ugr_col_letter}{start_row + 1}:"
+                    f"{ugr_col_letter}{end_row + 1})"
+                )
+                # 3) “A Receber” = célula da respectiva linha de resumo
+                a_receber_ref = f"'{worksheet.get_name()}'!{a_receber_col_letter}{a_receber_row_excel}"
+
+                consolidado_refs.append({
+                    "Supervisor": supervisor,
+                    "Consultor": consultor,
+                    "ReceitaRef": receita_ref,
+                    "LinhasValidasFormula": linhas_validas_formula,
+                    "AReceberRef": a_receber_ref
+                })
+
+            # Ajuste de largura das colunas na aba “Premiacao Detalhada com Resumo”
+            for col_num, col_name in enumerate(output_columns_order):
+                if col_name in df_input.columns:
+                    column_len = df_input[col_name].astype(str).map(len).max()
+                else:
+                    column_len = len(col_name)
+                header_len = len(col_name)
+                max_len = max(column_len if not pd.isna(column_len) else 0, header_len) + 2
+                worksheet.set_column(col_num, col_num, min(max_len, 50))
+
+            worksheet.set_column(2, 2, 20)  # Coluna C (Status Ausência)
+            worksheet.set_column(3, 3, 15)  # Coluna D (Valor moeda)
+
+            # ==== ABA “Consolidado” por Supervisor, com cálculo e formatação ====
+            worksheet_consolidado = workbook.add_worksheet('Consolidado')
+
+            # Formatos customizados para a aba Consolidado
+            header_consol_format = workbook.add_format({
+                'bold': True, 'fg_color': '#5B9BD5', 'font_color': 'white', 'border': 1, 'align': 'center'
+            })
+            supervisor_header_format_consol = workbook.add_format({
+                'bold': True, 'fg_color': '#D3D3D3', 'font_color': '#000000', 'border': 1, 'align': 'left'
+            })
+            default_consol_format = workbook.add_format({'border': 1})
+            currency_consol_format = workbook.add_format({'num_format': 'R$ #,##0.00', 'border': 1})
+            # Label (coluna B dos resumos) sem preenchimento, apenas negrito e alinhado à esquerda
+            label_no_fill = workbook.add_format({'bold': True, 'border': 1, 'align': 'left'})
+            # Formato azul escuro para a linha “15”
+            blue_totals_format = workbook.add_format({
+                'bold': True,
+                'fg_color': '#1F4E78',   # fundo azul-escuro
+                'font_color': 'white',   # texto branco
+                'border': 1,
+                'align': 'center'
+            })
+            # Formatos amarelos conforme solicitado:
+            yellow_number_format = workbook.add_format({
+                'fg_color': '#FFFF00', 'border': 1, 'align': 'center'
+            })
+            yellow_percent_format = workbook.add_format({
+                'num_format': '0.00%', 'fg_color': '#FFFF00', 'border': 1, 'align': 'center'
+            })
+            yellow_currency_format = workbook.add_format({
+                'num_format': 'R$ #,##0.00', 'fg_color': '#FFFF00', 'border': 1, 'align': 'center'
+            })
+
+            consolidado_columns = [
+                "Coordenador", "Supervisor", "Consultor",
+                "Receita", "Linhas Válidas", "A Receber"
+            ]
+
+            current_row_consolidado = 0
+            refs_df = pd.DataFrame(consolidado_refs)
+            grouped_refs = refs_df.groupby("Supervisor", sort=False)
+
+            for supervisor, group_refs in grouped_refs:
+                # Linha “Supervisor: NOME”
+                worksheet_consolidado.merge_range(
+                    current_row_consolidado, 0, current_row_consolidado, 5,
+                    f"Supervisor: {supervisor}", supervisor_header_format_consol
+                )
+                current_row_consolidado += 1
+
+                # Cabeçalho de colunas no Consolidado
+                for col_num, col_name in enumerate(consolidado_columns):
+                    worksheet_consolidado.write(
+                        current_row_consolidado, col_num, col_name, header_consol_format
+                    )
+                current_row_consolidado += 1
+
+                primeiro_consultor_row = current_row_consolidado
+                # Escrever cada consultor deste supervisor
+                for _, ref in group_refs.iterrows():
+                    worksheet_consolidado.write(current_row_consolidado, 0, "", default_consol_format)
+                    worksheet_consolidado.write(current_row_consolidado, 1, supervisor, default_consol_format)
+                    worksheet_consolidado.write(current_row_consolidado, 2, ref["Consultor"], default_consol_format)
+
+                    # Receita → referência ao Valor Líquido no detalhado
+                    worksheet_consolidado.write_formula(
+                        current_row_consolidado, 3,
+                        ref["ReceitaRef"], currency_consol_format
+                    )
+                    # Linhas Válidas → soma de UGR no detalhado
+                    worksheet_consolidado.write_formula(
+                        current_row_consolidado, 4,
+                        ref["LinhasValidasFormula"], default_consol_format
+                    )
+                    # A Receber → referência ao “A receber” no detalhado
+                    worksheet_consolidado.write_formula(
+                        current_row_consolidado, 5,
+                        ref["AReceberRef"], currency_consol_format
+                    )
+                    current_row_consolidado += 1
+
+                ultimo_consultor_row = current_row_consolidado - 1
+
+                # ─── Linha de “15” por Supervisor ───
+                totals_row_idx0 = current_row_consolidado
+                excel_totals_row = totals_row_idx0 + 1  # para referência 1-based
+
+                # Coluna C = "15" (azul escuro, branco e negrito)
+                worksheet_consolidado.write(totals_row_idx0, 2, "15", blue_totals_format)
+
+                # Coluna D = =SUM(D<primeira>:D<última>) (azul escuro, branco e negrito)
+                soma_receita_range = f"D{primeiro_consultor_row+1}:D{ultimo_consultor_row+1}"
+                worksheet_consolidado.write_formula(
+                    totals_row_idx0, 3,
+                    f"=SUM({soma_receita_range})", blue_totals_format
+                )
+
+                # Coluna E = =SUM(E<primeira>:E<última>) (azul escuro, branco e negrito)
+                soma_linhas_range = f"E{primeiro_consultor_row+1}:E{ultimo_consultor_row+1}"
+                worksheet_consolidado.write_formula(
+                    totals_row_idx0, 4,
+                    f"=SUM({soma_linhas_range})", blue_totals_format
+                )
+
+                # Coluna F = =SUM(F<primeira>:F<última>) (azul escuro, branco e negrito)
+                soma_areceber_range = f"F{primeiro_consultor_row+1}:F{ultimo_consultor_row+1}"
+                worksheet_consolidado.write_formula(
+                    totals_row_idx0, 5,
+                    f"=SUM({soma_areceber_range})", blue_totals_format
+                )
+
+                current_row_consolidado = totals_row_idx0 + 1
+
+                # ─── Linha "Média" ───
+                media_row_idx0 = current_row_consolidado
+                excel_media_row = media_row_idx0 + 1
+                # Coluna C (ao lado de "15") em amarelo
+                worksheet_consolidado.write(media_row_idx0, 2, "", yellow_number_format)
+                # Coluna B = "Média" (negrito, alinhado à esquerda, sem preenchimento)
+                worksheet_consolidado.write(media_row_idx0, 1, "Média", label_no_fill)
+                # Coluna D = =D<Totais>/C<Totais> (amarelo, número)
+                worksheet_consolidado.write_formula(
+                    media_row_idx0, 3,
+                    f"=D{excel_totals_row}/C{excel_totals_row}", yellow_number_format
+                )
+                # Coluna E = =E<Totais>/C<Totais> (amarelo, número)
+                worksheet_consolidado.write_formula(
+                    media_row_idx0, 4,
+                    f"=E{excel_totals_row}/C{excel_totals_row}", yellow_number_format
+                )
+                # Coluna F em branco amarelo
+                worksheet_consolidado.write(media_row_idx0, 5, "", yellow_number_format)
+
+                current_row_consolidado += 1
+
+                # ─── Linha "Faixa" ───
+                faixa_row_idx0 = current_row_consolidado
+                excel_faixa_row = faixa_row_idx0 + 1
+                # Coluna C (ao lado de "15") em amarelo
+                worksheet_consolidado.write(faixa_row_idx0, 2, "", yellow_number_format)
+                # Coluna B = "Faixa" (negrito, alinhado à esquerda, sem preenchimento)
+                worksheet_consolidado.write(faixa_row_idx0, 1, "Faixa", label_no_fill)
+                # Coluna D = 0.5 (amarelo, porcentagem)
+                worksheet_consolidado.write_number(faixa_row_idx0, 3, 0.5, yellow_percent_format)
+                # Coluna E = =D<Faixa>*D<Média> (amarelo, número)
+                worksheet_consolidado.write_formula(
+                    faixa_row_idx0, 4,
+                    f"=D{excel_faixa_row}*D{excel_media_row}", yellow_number_format
+                )
+                # Coluna F em branco amarelo
+                worksheet_consolidado.write(faixa_row_idx0, 5, "", yellow_number_format)
+
+                current_row_consolidado += 1
+
+                # ─── Linha "Bônus" ───
+                bonus_row_idx0 = current_row_consolidado
+                excel_bonus_row = bonus_row_idx0 + 1
+                # Coluna C (ao lado de "15") em amarelo
+                worksheet_consolidado.write(bonus_row_idx0, 2, "", yellow_number_format)
+                # Coluna B = "Bônus" (negrito, alinhado à esquerda, sem preenchimento)
+                worksheet_consolidado.write(bonus_row_idx0, 1, "Bônus", label_no_fill)
+                # Coluna D = 2 (amarelo, moeda)
+                worksheet_consolidado.write_number(bonus_row_idx0, 3, 2, yellow_currency_format)
+                # Coluna E = =E<Totais>*D<Bônus> (amarelo, moeda)
+                worksheet_consolidado.write_formula(
+                    bonus_row_idx0, 4,
+                    f"=E{excel_totals_row}*D{excel_bonus_row}", yellow_currency_format
+                )
+                # Coluna F = =E<Totais> (amarelo, número)
+                worksheet_consolidado.write_formula(
+                    bonus_row_idx0, 5,
+                    f"=E{excel_totals_row}", yellow_number_format
+                )
+
+                current_row_consolidado += 1
+
+                # ─── Linha "Total" ───
+                total_row_idx0 = current_row_consolidado
+                # Coluna C (ao lado de "15") em amarelo
+                worksheet_consolidado.write(total_row_idx0, 2, "", yellow_number_format)
+                # Coluna B = "Total" (negrito, alinhado à esquerda, sem preenchimento)
+                worksheet_consolidado.write(total_row_idx0, 1, "Total", label_no_fill)
+                # Coluna D em branco amarelo
+                worksheet_consolidado.write(total_row_idx0, 3, "", yellow_number_format)
+                # Coluna E = =SUM(E<Faixa>:E<Bônus>) (amarelo, moeda)
+                worksheet_consolidado.write_formula(
+                    total_row_idx0, 4,
+                    f"=SUM(E{excel_faixa_row}:E{excel_bonus_row})", yellow_currency_format
+                )
+                # Coluna F em branco amarelo
+                worksheet_consolidado.write(total_row_idx0, 5, "", yellow_number_format)
+
+                # Avança para o próximo supervisor
+                current_row_consolidado = total_row_idx0 + 1
+
+            # Ajusta larguras na aba “Consolidado”
+            for col_num, col_name in enumerate(consolidado_columns):
+                if col_name in ["Receita", "A Receber"]:
+                    column_len = max(len(col_name), 15)
+                else:
+                    max_content = refs_df[col_name].astype(str).map(len).max() if col_name in refs_df else len(col_name)
+                    column_len = max(len(col_name), max_content)
+                worksheet_consolidado.set_column(
+                    col_num, col_num, min(column_len + 2, 50)
+                )
+
+        print(f"Arquivo salvo em: {output_excel_path}")
+
+    except Exception as e:
+        print(f"Erro ao processar: {e}")
+
+if __name__ == "__main__":
+    # Ajuste abaixo para o local exato do seu XLSX no Windows:
+    input_file = r"G:\Meu Drive\Otavio\scripts\movel_pontuacao.xlsx"
+    output_file = r"G:\Meu Drive\Otavio\scripts\premiacao_consultores_ajustada.xlsx"
+    calcular_premiacao_com_resumo(input_file, output_file)
