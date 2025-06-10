@@ -1,0 +1,558 @@
+import pandas as pd
+import numpy as np
+import xlsxwriter
+from xlsxwriter.utility import xl_col_to_name
+
+def calcular_faixa(valor_liquido):
+    if valor_liquido <= 1000:
+        return 0.25
+    elif valor_liquido <= 1500:
+        return 0.50
+    elif valor_liquido <= 2000:
+        return 0.75
+    else:
+        return 1.00
+
+def calcular_premiacao_vvn_com_resumo(input_excel_path, output_excel_path):
+    """
+    Cria duas abas no arquivo de saída:
+      1) 'VVN Detalhado'  — detalha cada linha (até Pontos Finais) e calcula:
+           • Status Ausência
+           • Valor Líquido
+           • Linhas Válidas (1 para Ativo, -1 para Desconexão, 0 caso contrário)
+           • Multiplicador
+           • Pontos Finais
+      2) 'VVN Consolidado' — agrupa por supervisor, soma Receita (Valor Líquido), Linhas Válidas e A Receber,
+           exibindo:
+             • Linha fixa “15” (número de consultores) e, ao lado, a soma de Receita, Linhas Válidas e A Receber
+             • “Média” = (soma_Receita / <célula_do_15>), (soma_Linhas / <célula_do_15>), (soma_AReceber / <célula_do_15>)
+             • “Faixa” fixa 50% e (Média_Receita * 50%), deixa coluna de “Linhas Válidas” em branco
+             • “Bônus” = R$ 2,00; colunas “Linhas Válidas” = (Média_Linhas * 2); coluna “A Receber” = Média_AReceber
+             • “Total” = (Faixa_Receita + Bônus_Receita), (Faixa_Linhas + Bônus_Linhas), (Faixa_AReceber + Bônus_AReceber)
+    """
+
+    try:
+        # Carrega todas as abas do Excel de entrada
+        xls = pd.ExcelFile(input_excel_path)
+        todas_abas = xls.sheet_names
+
+        # Verifica existência da aba "Planilha1"
+        if "Planilha1" not in todas_abas:
+            raise KeyError("Não foi encontrada nenhuma aba chamada 'Planilha1'.")
+        aba_principal = "Planilha1"
+
+        # Localiza a aba de ausências, ignorando caixa (uppercase/lowercase)
+        aba_ausencias = None
+        for nome in todas_abas:
+            if nome.strip().upper() == "AUSENCIAS":
+                aba_ausencias = nome
+                break
+        if aba_ausencias is None:
+            raise KeyError("Não foi encontrada nenhuma aba cujo nome, em uppercase, seja 'AUSENCIAS'.")
+
+        # --- Leitura da aba principal (“Planilha1”) ---
+        df_input = xls.parse(aba_principal)
+        df_input.columns = df_input.columns.str.strip().str.upper()
+
+        # --- Leitura da aba de ausências ---
+        df_ausencias = xls.parse(aba_ausencias)
+        df_ausencias.columns = df_ausencias.columns.str.strip().str.upper()
+
+        # Verifica colunas na aba de ausências
+        aus_cols = list(df_ausencias.columns)
+        if "CONSULTOR" not in aus_cols or "AUSENCIAS" not in aus_cols:
+            raise KeyError("Na aba de ausências, faltam as colunas 'CONSULTOR' e/ou 'AUSENCIAS'.")
+        idx_consultor = aus_cols.index("CONSULTOR")
+        idx_ausencias = aus_cols.index("AUSENCIAS")
+        nome_col_cons = df_ausencias.columns[idx_consultor]
+        nome_col_aus = df_ausencias.columns[idx_ausencias]
+
+        # Monta dicionário consultor → quantidade de ausências
+        ausencias_dict = {
+            str(row[nome_col_cons]).strip().upper(): int(row[nome_col_aus])
+            for _, row in df_ausencias.iterrows()
+            if not pd.isnull(row[nome_col_cons]) and not pd.isnull(row[nome_col_aus])
+        }
+        consultores_com_ausencia = {nome for nome, aus in ausencias_dict.items() if aus >= 1}
+
+        # --- Mapeamento das colunas da aba principal para nomes internos (lowercase) ---
+        column_mapping = {
+            'CONSULTOR': 'consultor',
+            'SUPERVISOR': 'supervisor',
+            'COORDENADOR': 'coordenador',
+            'VALOR PRODUTO ATUAL': 'valor_produto_atual',
+            'DATA EVENTO': 'data_evento',
+            'DATA BAIXA': 'data_baixa',
+            'MOVIMENTO PRINCIPAL': 'movimento_principal',
+            'CNPJ / CPF CLIENTE': 'cnpj_cpf_cliente',
+            'PRODUTO ATUAL': 'produto_atual',
+            'NOME CLIENTE': 'nome_cliente'
+        }
+        df_input.rename(columns=column_mapping, inplace=True)
+
+        # Verifica colunas obrigatórias em df_input
+        required_columns = [
+            'consultor', 'supervisor', 'coordenador', 'valor_produto_atual',
+            'movimento_principal', 'data_evento', 'data_baixa',
+            'cnpj_cpf_cliente', 'produto_atual', 'nome_cliente'
+        ]
+        missing_columns = [col for col in required_columns if col not in df_input.columns]
+        if missing_columns:
+            raise KeyError(f"Em Planilha1, faltam as colunas: {', '.join(missing_columns)}")
+
+        # --- Conversão de tipos e preenchimento ---
+        df_input["valor_produto_atual"] = pd.to_numeric(
+            df_input["valor_produto_atual"], errors='coerce'
+        ).fillna(0)
+        df_input["data_evento"] = pd.to_datetime(
+            df_input["data_evento"], errors='coerce', dayfirst=True
+        )
+        df_input["data_baixa"] = pd.to_datetime(
+            df_input["data_baixa"], errors='coerce', dayfirst=True
+        )
+        df_input["consultor"] = df_input["consultor"].fillna("Consultor Desconhecido")
+        df_input["supervisor"] = df_input["supervisor"].fillna("Supervisor Desconhecido")
+        df_input["coordenador"] = df_input["coordenador"].fillna("N/A")
+        df_input["movimento_principal"] = df_input["movimento_principal"].astype(str).str.strip().str.title()
+
+        # --- Calcula Receita Bruta, Linhas Válidas, Multiplicador e Pontos Finais ---
+        df_input["receita_bruta"] = np.abs(df_input["valor_produto_atual"])
+
+        def get_linhas_validas(mov):
+            mov_lower = mov.lower()
+            if "desconexao" in mov_lower or "desconexão" in mov_lower:
+                return -1
+            elif "ativo" in mov_lower:
+                return 1
+            else:
+                return 0
+
+        df_input["linhas_validas"] = df_input["movimento_principal"].apply(get_linhas_validas)
+
+        def get_multiplicador(mov, cons):
+            mov_lower = mov.lower()
+            c = cons.strip().upper()
+            if "desconexao" in mov_lower or "desconexão" in mov_lower:
+                return -2 if c in consultores_com_ausencia else -1
+            elif "ativo" in mov_lower:
+                return 1
+            else:
+                return 0
+
+        df_input["multiplicador"] = df_input.apply(
+            lambda row: get_multiplicador(row["movimento_principal"], row["consultor"]),
+            axis=1
+        )
+        df_input["pontos_finais"] = df_input["receita_bruta"] * df_input["multiplicador"]
+
+        # Ordena antes de escrever
+        df_input = df_input.sort_values(
+            by=["supervisor", "consultor", "data_evento"],
+            ascending=True, na_position='last'
+        )
+
+        # --- Cria o Excel de saída com duas abas ---
+        with pd.ExcelWriter(output_excel_path, engine='xlsxwriter') as writer:
+            workbook = writer.book
+
+            # ========================= ABA “VVN Detalhado” =========================
+            worksheet_vvn = workbook.add_worksheet("VVN Detalhado")
+
+            # Formatos para “VVN Detalhado”
+            header_format = workbook.add_format({
+                "bold": True, "fg_color": "#4F81BD", "font_color": "white",
+                "border": 1, "align": "center"
+            })
+            currency_format = workbook.add_format({
+                "num_format": "R$ #,##0.00", "border": 1, "align": "right"
+            })
+            default_format = workbook.add_format({"border": 1})
+            date_format = workbook.add_format({
+                "num_format": "dd/mm/yyyy", "border": 1, "align": "center"
+            })
+            summary_label_format = workbook.add_format({
+                "bold": True, "border": 1, "align": "right"
+            })
+            summary_value_format_currency = workbook.add_format({
+                "num_format": "R$ #,##0.00", "bold": True,
+                "border": 1, "align": "right"
+            })
+
+            # Colunas a serem exibidas em “VVN Detalhado”
+            vvn_columns = [
+                "coordenador",
+                "supervisor",
+                "consultor",
+                "cnpj_cpf_cliente",
+                "nome_cliente",
+                "movimento_principal",
+                "data_evento",
+                "data_baixa",
+                "produto_atual",
+                "valor_produto_atual",
+                "receita_bruta",
+                "linhas_validas",
+                "multiplicador",
+                "pontos_finais"
+            ]
+
+            current_row = 0
+            consolidado_refs_vvn = []
+
+            # Agrupa por supervisor → consultor
+            grouped_vvn = df_input.groupby(["supervisor", "consultor"], sort=False, dropna=False)
+
+            for (supervisor, consultor), group in grouped_vvn:
+                # Se não for o primeiro grupo, insere linha em branco
+                if current_row > 1:
+                    current_row += 1
+
+                # Escreve cabeçalho de colunas
+                for col_idx, col_name in enumerate(vvn_columns):
+                    worksheet_vvn.write(current_row, col_idx, col_name, header_format)
+                current_row += 1
+
+                # Define início e fim das linhas de dados deste consultor
+                start_row = current_row
+                end_row = current_row + len(group) - 1
+
+                # Índices para montar fórmulas:
+                idx_receita = vvn_columns.index("receita_bruta")
+                idx_linhas = vvn_columns.index("linhas_validas")
+                idx_multiplicador = vvn_columns.index("multiplicador")
+                idx_pontos_finais = vvn_columns.index("pontos_finais")
+
+                # Linha (0-based) do “Status Ausência”
+                summary_status_row = end_row + 1
+                summary_status_excel_row = summary_status_row + 1  # Excel 1-based
+
+                # Coluna 2 (C) será “Status Ausência”
+                summary_start_col = 2
+                absence_col_letter = xl_col_to_name(summary_start_col + 1)
+
+                # Escreve cada linha de detalhe
+                for _, row_data in group.iterrows():
+                    for col_idx, col_name in enumerate(vvn_columns):
+                        if col_name not in ["receita_bruta", "linhas_validas", "multiplicador", "pontos_finais"]:
+                            value = row_data.get(col_name, None)
+                        else:
+                            value = None
+
+                        if col_name == "linhas_validas":
+                            worksheet_vvn.write_number(
+                                current_row, col_idx,
+                                int(row_data["linhas_validas"]), default_format
+                            )
+
+                        elif col_name == "multiplicador":
+                            mov_text = str(row_data["movimento_principal"]).lower()
+                            # Reconhece “desconexao” ou “desconexão”
+                            if "desconexao" in mov_text or "desconexão" in mov_text:
+                                # Fórmula dinâmica de multiplicador com -2 ou -1
+                                absence_cell = f"{absence_col_letter}{summary_status_excel_row}"
+                                formula = f"=IF({absence_cell}>=1,-2,-1)"
+                                worksheet_vvn.write_formula(current_row, col_idx, formula, default_format)
+                            else:
+                                # Valor fixo (por ex. 1 para Ativo)
+                                worksheet_vvn.write_number(
+                                    current_row, col_idx,
+                                    float(row_data["multiplicador"]), default_format
+                                )
+
+                        elif col_name == "pontos_finais":
+                            # Fórmula: =<Receita Bruta> * <Multiplicador>
+                            receita_cell = f"{xl_col_to_name(idx_receita)}{current_row+1}"
+                            multi_cell = f"{xl_col_to_name(idx_multiplicador)}{current_row+1}"
+                            formula_pf = f"={receita_cell}*{multi_cell}"
+                            worksheet_vvn.write_formula(current_row, col_idx, formula_pf, currency_format)
+
+                        elif col_name == "receita_bruta":
+                            worksheet_vvn.write_number(
+                                current_row, col_idx,
+                                float(row_data["receita_bruta"]), currency_format
+                            )
+
+                        elif col_name in ["data_evento", "data_baixa"]:
+                            if pd.isna(row_data.get(col_name, None)):
+                                worksheet_vvn.write(current_row, col_idx, "", default_format)
+                            else:
+                                worksheet_vvn.write_datetime(current_row, col_idx, row_data[col_name], date_format)
+
+                        elif col_name == "valor_produto_atual":
+                            worksheet_vvn.write_number(
+                                current_row, col_idx,
+                                float(row_data["valor_produto_atual"]), currency_format
+                            )
+
+                        else:
+                            # Qualquer outra coluna textual
+                            if pd.isna(row_data.get(col_name, None)):
+                                worksheet_vvn.write(current_row, col_idx, "", default_format)
+                            else:
+                                worksheet_vvn.write(current_row, col_idx, row_data[col_name], default_format)
+
+                    current_row += 1
+
+                # --- Bloco de Resumo ---
+
+                # 1) “Status Ausência”
+                nome_cons_upper = str(group["consultor"].iloc[0]).strip().upper()
+                qtde_ausencias = ausencias_dict.get(nome_cons_upper, 0)
+                worksheet_vvn.write(current_row, summary_start_col, "Status Ausência", summary_label_format)
+                worksheet_vvn.write(current_row, summary_start_col + 1, qtde_ausencias, summary_value_format_currency)
+                current_row += 1
+
+                # 2) “Valor Líquido” = soma de “pontos_finais”
+                valor_liquido_row_excel = summary_status_row + 2
+                valor_liquido_col_letter = xl_col_to_name(summary_start_col + 1)
+                worksheet_vvn.write(current_row, summary_start_col, "Valor Líquido", summary_label_format)
+                soma_pontos = (
+                    f"=SUM({xl_col_to_name(idx_pontos_finais)}"
+                    f"{start_row+1}:{xl_col_to_name(idx_pontos_finais)}{end_row+1})"
+                )
+                worksheet_vvn.write_formula(current_row, summary_start_col + 1, soma_pontos, summary_value_format_currency)
+                current_row += 1
+
+                # 3) “Faixa”
+                faixa_col_letter = xl_col_to_name(summary_start_col + 1)
+                faixa_row_excel = (summary_status_row + 2) + 1
+                faixa_formula = (
+                    f"=IF({faixa_col_letter}{valor_liquido_row_excel}<=1000,0.25,"
+                    f"IF({faixa_col_letter}{valor_liquido_row_excel}<=1500,0.5,"
+                    f"IF({faixa_col_letter}{valor_liquido_row_excel}<=2000,0.75,1)))"
+                )
+                worksheet_vvn.write(current_row, summary_start_col, "Faixa", summary_label_format)
+                worksheet_vvn.write_formula(current_row, summary_start_col + 1, faixa_formula, summary_value_format_currency)
+                current_row += 1
+
+                # 4) “Valor PJ” = Valor Líquido * Faixa
+                valor_liquido_cell = f"{faixa_col_letter}{valor_liquido_row_excel}"
+                faixa_cell = f"{xl_col_to_name(summary_start_col+1)}{faixa_row_excel}"
+                valor_pj_row_excel = faixa_row_excel + 1
+                valor_pj_col_letter = xl_col_to_name(summary_start_col + 1)
+                vpj_formula = f"={valor_liquido_cell}*{faixa_cell}"
+                worksheet_vvn.write(current_row, summary_start_col, "Valor PJ", summary_label_format)
+                worksheet_vvn.write_formula(current_row, summary_start_col + 1, vpj_formula, summary_value_format_currency)
+                current_row += 1
+
+                # 5) “A Receber” = IF((Valor PJ)<0,0,Valor PJ)
+                a_receber_row_excel = valor_pj_row_excel + 1
+                a_receber_col_letter = valor_pj_col_letter
+                formula_areceber = (
+                    f"=IF({valor_pj_col_letter}{valor_pj_row_excel}<0,0,{valor_pj_col_letter}{valor_pj_row_excel})"
+                )
+                worksheet_vvn.write(current_row, summary_start_col, "A Receber", summary_label_format)
+                worksheet_vvn.write_formula(current_row, summary_start_col + 1, formula_areceber, summary_value_format_currency)
+                current_row += 1
+
+                # --- Armazena referências para aba Consolidado ---
+                ref_receita = f"'{worksheet_vvn.get_name()}'!{valor_liquido_col_letter}{valor_liquido_row_excel}"
+                ref_linhas = (
+                    f"=SUM('{worksheet_vvn.get_name()}'!"
+                    f"{xl_col_to_name(idx_linhas)}{start_row+1}:"
+                    f"{xl_col_to_name(idx_linhas)}{end_row+1})"
+                )
+                ref_areceber = f"'{worksheet_vvn.get_name()}'!{a_receber_col_letter}{a_receber_row_excel}"
+                consolidado_refs_vvn.append({
+                    "Supervisor": supervisor,
+                    "Consultor": consultor,
+                    "ReceitaRef": ref_receita,
+                    "LinhasValidasFormula": ref_linhas,
+                    "AReceberRef": ref_areceber
+                })
+
+            # Ajusta largura de colunas em “VVN Detalhado”
+            for col_idx, col_name in enumerate(vvn_columns):
+                if col_name in df_input.columns:
+                    max_len = df_input[col_name].astype(str).map(len).max()
+                else:
+                    max_len = len(col_name)
+                header_len = len(col_name)
+                width = max(max_len, header_len) + 2
+                worksheet_vvn.set_column(col_idx, col_idx, min(width, 50))
+
+
+            # ========================= ABA “VVN Consolidado” =========================
+            worksheet_vvn_cons = workbook.add_worksheet("VVN Consolidado")
+
+            # Formatos para “VVN Consolidado”
+            header_consol_format = workbook.add_format({
+                "bold": True, "fg_color": "#5B9BD5", "font_color": "white",
+                "border": 1, "align": "center"
+            })
+            supervisor_header_format_consol = workbook.add_format({
+                "bold": True, "fg_color": "#D3D3D3", "font_color": "#000000",
+                "border": 1, "align": "left"
+            })
+            default_consol_format = workbook.add_format({"border": 1})
+            currency_consol_format = workbook.add_format({
+                "num_format": "R$ #,##0.00", "border": 1, "align": "right"
+            })
+            number_consol_format = workbook.add_format({
+                "num_format": "0", "border": 1, "align": "center"
+            })
+            percent_consol_format = workbook.add_format({
+                "num_format": "0.00%", "border": 1, "align": "right"
+            })
+            yellow_summary_label = workbook.add_format({
+                "bold": True, "fg_color": "#FFFF00", "border": 1, "align": "right"
+            })
+            yellow_summary_value_num = workbook.add_format({
+                "num_format": "0.00", "fg_color": "#FFFF00", "border": 1, "align": "right"
+            })
+            yellow_summary_value_pct = workbook.add_format({
+                "num_format": "0.00%", "fg_color": "#FFFF00", "border": 1, "align": "right"
+            })
+            yellow_summary_value_cur = workbook.add_format({
+                "num_format": "R$ #,##0.00", "fg_color": "#FFFF00", "border": 1, "align": "right"
+            })
+            darkblue_bold = workbook.add_format({
+                "bold": True, "fg_color": "#003366", "font_color": "white", "border": 1, "align": "center"
+            })
+
+            # Colunas a serem exibidas em “VVN Consolidado”
+            consol_columns = ["Supervisor", "Consultor", "Receita", "Linhas Válidas", "A Receber"]
+            current_row_cons = 0
+            refs_df_vvn = pd.DataFrame(consolidado_refs_vvn)
+            grouped_cons_vvn = refs_df_vvn.groupby("Supervisor", sort=False)
+
+            for supervisor, group_refs in grouped_cons_vvn:
+                # Linha “Supervisor: X”
+                worksheet_vvn_cons.merge_range(
+                    current_row_cons, 0, current_row_cons, 4,
+                    f"Supervisor: {supervisor}", supervisor_header_format_consol
+                )
+                current_row_cons += 1
+
+                # Cabeçalho de colunas
+                for i, col in enumerate(consol_columns):
+                    worksheet_vvn_cons.write(current_row_cons, i, col, header_consol_format)
+                current_row_cons += 1
+
+                first_data_row = current_row_cons + 1  # 1-based no Excel
+                for _, ref in group_refs.iterrows():
+                    worksheet_vvn_cons.write(current_row_cons, 0, "", default_consol_format)
+                    worksheet_vvn_cons.write(current_row_cons, 1, ref["Consultor"], default_consol_format)
+                    # Receita (Valor Líquido)
+                    worksheet_vvn_cons.write_formula(
+                        current_row_cons, 2,
+                        ref["ReceitaRef"], currency_consol_format
+                    )
+                    # Linhas Válidas
+                    worksheet_vvn_cons.write_formula(
+                        current_row_cons, 3,
+                        ref["LinhasValidasFormula"], number_consol_format
+                    )
+                    # A Receber
+                    worksheet_vvn_cons.write_formula(
+                        current_row_cons, 4,
+                        ref["AReceberRef"], currency_consol_format
+                    )
+                    current_row_cons += 1
+                last_data_row = current_row_cons  # 1-based após último consultor
+
+                # Linha fixa “15” em azul escuro (coluna 1 = “15”)
+                worksheet_vvn_cons.write(current_row_cons, 1, 15, darkblue_bold)
+
+                # Captura a linha do “15” para usar na média
+                fixed_row_excel = current_row_cons + 1  # converte 0-based para Excel 1-based
+
+                # Ao lado do “15”: soma de Receita, soma de Linhas Válidas e soma de A Receber
+                soma_receita = f"=SUM(C{first_data_row}:C{last_data_row-1})"
+                soma_linhas = f"=SUM(D{first_data_row}:D{last_data_row-1})"
+                soma_areceber = f"=SUM(E{first_data_row}:E{last_data_row-1})"
+                worksheet_vvn_cons.write_formula(current_row_cons, 2, soma_receita, darkblue_bold)
+                worksheet_vvn_cons.write_formula(current_row_cons, 3, soma_linhas, darkblue_bold)
+                worksheet_vvn_cons.write_formula(current_row_cons, 4, soma_areceber, darkblue_bold)
+                current_row_cons += 1
+
+                # ===== Bloco de Resumo por Supervisor =====
+
+                # 1) Média: (total / <número de consultores>) usando a própria célula do “15”
+                worksheet_vvn_cons.write(current_row_cons, 1, "Média", yellow_summary_label)
+                # Receita média = C<fixed_row_excel> / B<fixed_row_excel>
+                worksheet_vvn_cons.write_formula(
+                    current_row_cons, 2,
+                    f"=C{fixed_row_excel}/B{fixed_row_excel}", yellow_summary_value_num
+                )
+                # Linhas médias = D<fixed_row_excel> / B<fixed_row_excel>
+                worksheet_vvn_cons.write_formula(
+                    current_row_cons, 3,
+                    f"=D{fixed_row_excel}/B{fixed_row_excel}", yellow_summary_value_num
+                )
+                # A Receber média = E<fixed_row_excel> / B<fixed_row_excel>
+                worksheet_vvn_cons.write_formula(
+                    current_row_cons, 4,
+                    f"=E{fixed_row_excel}/B{fixed_row_excel}", yellow_summary_value_num
+                )
+                current_row_cons += 1
+
+                # 2) Faixa fixa 50% e (Média_Receita * 50%), coluna Linhas Válidas em branco
+                worksheet_vvn_cons.write(current_row_cons, 1, "Faixa", yellow_summary_label)
+                # C = 50%
+                worksheet_vvn_cons.write_number(current_row_cons, 2, 0.50, yellow_summary_value_pct)
+                # D = blank (não se usa faixa para “Linhas Válidas”)
+                worksheet_vvn_cons.write_blank(current_row_cons, 3, None, yellow_summary_value_num)
+                # E = C<Média> * 50% → Média_Receita está em C desta linha acima
+                worksheet_vvn_cons.write_formula(
+                    current_row_cons, 4,
+                    f"=C{current_row_cons}*C{current_row_cons-1}", yellow_summary_value_cur
+                )
+                current_row_cons += 1
+
+                # 3) Bônus: R$ 2,00; Linhas Válidas bônus = (Média_Linhas * 2); A Receber bônus = Média_AReceber
+                worksheet_vvn_cons.write(current_row_cons, 1, "Bônus", yellow_summary_label)
+                # C = R$ 2,00
+                worksheet_vvn_cons.write_number(current_row_cons, 2, 2, yellow_summary_value_cur)
+                # D = Média_Linhas (linha de “Média”) * 2
+                worksheet_vvn_cons.write_formula(
+                    current_row_cons, 3,
+                    f"=D{current_row_cons-1}*2", yellow_summary_value_num
+                )
+                # E = Média_AReceber (linha de “Média”)
+                worksheet_vvn_cons.write_formula(
+                    current_row_cons, 4,
+                    f"=E{current_row_cons-2}", yellow_summary_value_cur
+                )
+                current_row_cons += 1
+
+                # 4) Total = (Faixa + Bônus) em cada coluna
+                worksheet_vvn_cons.write(current_row_cons, 1, "Total", yellow_summary_label)
+                # C_total = C_faixa (2 linhas acima) + C_bônus (1 linha acima)
+                worksheet_vvn_cons.write_formula(
+                    current_row_cons, 2,
+                    f"=C{current_row_cons-2}+C{current_row_cons-1}", yellow_summary_value_cur
+                )
+                # D_total = D_faixa (blank) + D_bônus
+                worksheet_vvn_cons.write_formula(
+                    current_row_cons, 3,
+                    f"=D{current_row_cons-2}+D{current_row_cons-1}", yellow_summary_value_num
+                )
+                # E_total = E_faixa (2 linhas acima) + E_bônus (1 linha acima)
+                worksheet_vvn_cons.write_formula(
+                    current_row_cons, 4,
+                    f"=E{current_row_cons-2}+E{current_row_cons-1}", yellow_summary_value_cur
+                )
+                current_row_cons += 2  # pula uma linha antes do próximo supervisor
+
+            # Ajusta largura de colunas em “VVN Consolidado”
+            for col_idx, col_name in enumerate(consol_columns):
+                if col_name in ["Receita", "A Receber"]:
+                    width = max(len(col_name), 12) + 2
+                elif col_name == "Linhas Válidas":
+                    width = max(len(col_name), 12) + 2
+                else:
+                    max_content = refs_df_vvn[col_name].astype(str).map(len).max() if col_name in refs_df_vvn else len(col_name)
+                    width = max(len(col_name), max_content) + 2
+                worksheet_vvn_cons.set_column(col_idx, col_idx, min(width, 50))
+
+        print(f"Arquivo de VVN salvo em: {output_excel_path}")
+
+    except Exception as e:
+        print(f"Erro ao processar VVN: {e}")
+
+
+if __name__ == "__main__":
+    input_file = r"G:\Meu Drive\Otavio\scripts\vvn_pontuacao.xlsx"
+    output_file = r"G:\Meu Drive\Otavio\scripts\premiacao_vvn_ajustada.xlsx"
+    calcular_premiacao_vvn_com_resumo(input_file, output_file)
